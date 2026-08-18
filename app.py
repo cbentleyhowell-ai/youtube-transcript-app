@@ -57,40 +57,65 @@ def clean_transcript_text(text):
         text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-def get_video_transcript(v_id):
-    """Deep search strategy to fetch ANY available transcript track."""
-    yt = YouTubeTranscriptApi()
-    
-    # 1. Try listing all available transcript objects for this video
-    try:
-        transcript_list = yt.list(v_id)
+def fetch_ytdlp_subtitles(v_url):
+    """Fallback transcript engine using yt-dlp to bypass cloud IP blocks."""
+    ydl_opts = {
+        'skip_download': True,
+        'writesubtitles': True,
+        'writeautomaticsub': True,
+        'subtitleslangs': ['en', 'en-US', 'en-GB'],
+        'quiet': True
+    }
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(v_url, download=False)
+        subtitles = info.get('subtitles') or info.get('automatic_captions')
+        if not subtitles:
+            raise Exception("No subtitles found via web fallback.")
         
-        # Look for English (manual or auto-generated)
-        for t in transcript_list:
-            if t.language_code.startswith('en'):
+        # Grab first available English track
+        for lang in ['en', 'en-US', 'en-GB']:
+            if lang in subtitles:
+                # Extract text entries from webvtt / json
+                formats = subtitles[lang]
+                for fmt in formats:
+                    if fmt.get('ext') == 'json3':
+                        import requests
+                        res = requests.get(fmt['url']).json()
+                        text_chunks = []
+                        for event in res.get('events', []):
+                            for seg in event.get('segs', []):
+                                chunk = seg.get('utf8', '').strip()
+                                if chunk and chunk != '\n':
+                                    text_chunks.append(chunk)
+                        full_text = " ".join(text_chunks)
+                        if full_text:
+                            return [{"start": 0, "duration": 0, "text": full_text}]
+    raise Exception("Could not parse subtitle track via fallback.")
+
+def get_video_transcript(v_id, v_url):
+    """Dual-engine transcript fetcher (API primary -> yt-dlp fallback)."""
+    # Engine 1: youtube-transcript-api
+    try:
+        yt = YouTubeTranscriptApi()
+        try:
+            transcript_list = yt.list(v_id)
+            for t in transcript_list:
+                if t.language_code.startswith('en'):
+                    fetched = t.fetch()
+                    return fetched.to_raw_data() if hasattr(fetched, 'to_raw_data') else fetched
+            for t in transcript_list:
                 fetched = t.fetch()
                 return fetched.to_raw_data() if hasattr(fetched, 'to_raw_data') else fetched
-                
-        # If no English, grab the first available transcript track
-        for t in transcript_list:
-            fetched = t.fetch()
-            return fetched.to_raw_data() if hasattr(fetched, 'to_raw_data') else fetched
-    except Exception:
-        pass
+        except Exception:
+            pass
 
-    # 2. Direct fetch fallback with expanded language tags
-    try:
-        fetched = yt.fetch(v_id, languages=['en', 'en-US', 'en-GB', 'a.en', 'en-CA', 'en-AU'])
+        fetched = yt.fetch(v_id, languages=['en', 'en-US', 'en-GB', 'a.en'])
         return fetched.to_raw_data() if hasattr(fetched, 'to_raw_data') else fetched
     except Exception:
         pass
 
-    # 3. Last-resort unconstrained fetch
-    try:
-        fetched = yt.fetch(v_id)
-        return fetched.to_raw_data() if hasattr(fetched, 'to_raw_data') else fetched
-    except Exception as e:
-        raise e
+    # Engine 2: Fallback to yt-dlp browser-mimicking extractor
+    return fetch_ytdlp_subtitles(v_url)
 
 if st.button("🚀 Process & Generate Text Files"):
     if not urls_to_process:
@@ -135,8 +160,7 @@ if st.button("🚀 Process & Generate Text Files"):
             successful_count = 0
 
             for idx, entry in enumerate(video_entries):
-                # Rate limit protection delay (1.2 seconds pause between YouTube requests)
-                time.sleep(1.2)
+                time.sleep(1.5)  # Pause to avoid rapid-fire cloud blocking
 
                 raw_id = entry.get('id') or entry.get('url') or entry.get('webpage_url')
                 v_id = extract_video_id(str(raw_id)) if raw_id else None
@@ -152,10 +176,10 @@ if st.button("🚀 Process & Generate Text Files"):
                     continue
 
                 try:
-                    transcript = get_video_transcript(v_id)
+                    transcript = get_video_transcript(v_id, v_url)
                     
                     start_time = format_time(transcript[0]['start'])
-                    end_time = format_time(transcript[-1]['start'] + transcript[-1]['duration'])
+                    end_time = format_time(transcript[-1]['start'] + transcript[-1]['duration']) if transcript[-1]['duration'] > 0 else "End"
                     
                     raw_text = " ".join([item['text'] for item in transcript])
                     full_transcript_text = clean_transcript_text(raw_text)
