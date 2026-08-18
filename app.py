@@ -3,6 +3,7 @@ import io
 import re
 import time
 import zipfile
+import requests
 from yt_dlp import YoutubeDL
 from youtube_transcript_api import YouTubeTranscriptApi
 
@@ -58,7 +59,7 @@ def clean_transcript_text(text):
     return text
 
 def fetch_ytdlp_subtitles(v_url):
-    """Fallback transcript engine using yt-dlp to bypass cloud IP blocks."""
+    """Fallback transcript engine using yt-dlp to bypass cloud IP blocks safely."""
     ydl_opts = {
         'skip_download': True,
         'writesubtitles': True,
@@ -72,28 +73,47 @@ def fetch_ytdlp_subtitles(v_url):
         if not subtitles:
             raise Exception("No subtitles found via web fallback.")
         
-        # Grab first available English track
+        # Check available English subtitle tracks
         for lang in ['en', 'en-US', 'en-GB']:
             if lang in subtitles:
-                # Extract text entries from webvtt / json
                 formats = subtitles[lang]
+                
+                # 1. Try json3 format
                 for fmt in formats:
                     if fmt.get('ext') == 'json3':
-                        import requests
-                        res = requests.get(fmt['url']).json()
-                        text_chunks = []
-                        for event in res.get('events', []):
-                            for seg in event.get('segs', []):
-                                chunk = seg.get('utf8', '').strip()
-                                if chunk and chunk != '\n':
-                                    text_chunks.append(chunk)
-                        full_text = " ".join(text_chunks)
-                        if full_text:
-                            return [{"start": 0, "duration": 0, "text": full_text}]
-    raise Exception("Could not parse subtitle track via fallback.")
+                        try:
+                            res = requests.get(fmt['url'], timeout=10).json()
+                            text_chunks = []
+                            for event in res.get('events', []):
+                                for seg in event.get('segs', []):
+                                    chunk = seg.get('utf8', '').strip()
+                                    if chunk and chunk != '\n':
+                                        text_chunks.append(chunk)
+                            full_text = " ".join(text_chunks)
+                            if full_text.strip():
+                                return [{"start": 0, "duration": 0, "text": full_text}]
+                        except Exception:
+                            continue
+                            
+                # 2. Try WebVTT / plaintext format
+                for fmt in formats:
+                    if fmt.get('ext') in ['vtt', 'srv1', 'ttml']:
+                        try:
+                            res_text = requests.get(fmt['url'], timeout=10).text
+                            # Strip VTT timestamps/headers
+                            clean_vtt = re.sub(r'WEBVTT.*?\n', '', res_text)
+                            clean_vtt = re.sub(r'\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}.*', '', clean_vtt)
+                            clean_vtt = re.sub(r'<[^>]*>', '', clean_vtt)
+                            clean_vtt = re.sub(r'\n+', ' ', clean_vtt).strip()
+                            if clean_vtt:
+                                return [{"start": 0, "duration": 0, "text": clean_vtt}]
+                        except Exception:
+                            continue
+
+    raise Exception("Could not parse subtitle track via web fallback.")
 
 def get_video_transcript(v_id, v_url):
-    """Dual-engine transcript fetcher (API primary -> yt-dlp fallback)."""
+    """Dual-engine transcript fetcher."""
     # Engine 1: youtube-transcript-api
     try:
         yt = YouTubeTranscriptApi()
@@ -114,7 +134,7 @@ def get_video_transcript(v_id, v_url):
     except Exception:
         pass
 
-    # Engine 2: Fallback to yt-dlp browser-mimicking extractor
+    # Engine 2: yt-dlp browser-mimicking fallback
     return fetch_ytdlp_subtitles(v_url)
 
 if st.button("🚀 Process & Generate Text Files"):
@@ -160,7 +180,7 @@ if st.button("🚀 Process & Generate Text Files"):
             successful_count = 0
 
             for idx, entry in enumerate(video_entries):
-                time.sleep(1.5)  # Pause to avoid rapid-fire cloud blocking
+                time.sleep(1.5)  # Rate limit protection pause
 
                 raw_id = entry.get('id') or entry.get('url') or entry.get('webpage_url')
                 v_id = extract_video_id(str(raw_id)) if raw_id else None
